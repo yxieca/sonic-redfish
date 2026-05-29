@@ -1,0 +1,69 @@
+#######################################
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Nexthop AI
+# Copyright (C) 2024 SONiC Project
+# Author: Nexthop AI
+# Author: SONiC Project
+# License file: sonic-redfish/LICENSE
+#######################################
+
+# Test environment for sonic-redfish integration tests.
+#
+# Mirrors the docker-sonic-redfish container layout:
+#   - dbus-daemon (system bus)
+#   - redis-server (CONFIG_DB db4, STATE_DB db6)
+#   - sonic-dbus-bridge
+#   - bmcweb
+#
+# Tests run via pytest against the live Redfish API on localhost:443.
+
+FROM sonic-redfish-builder:latest
+
+# Builder image's default USER is `builder` (non-root) so workspace bind
+# mounts stay owned by the host user. The test image, however, must run
+# privileged services (systemd, dbus, redis) and install packages, so
+# switch back to root for the rest of this Dockerfile and at runtime.
+USER root
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    redis-server \
+    curl \
+    procps \
+    jq \
+    # D-Bus utilities for debugging
+    dbus \
+    systemd \
+    # Python test dependencies
+    python3-pytest \
+    python3-requests \
+    python3-redis \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create user/group for bmcweb PAM authentication (bmcweb/bmcweb).
+# The bridge's user_mgr.cpp registers GetUserInfo only for the "bmcweb" user
+# (adminUserName), so the test PAM identity must match.
+RUN groupadd -f redfish && \
+    useradd -m -s /bin/false -g redfish -c "Redfish User" bmcweb && \
+    echo "bmcweb:bmcweb" | chpasswd
+
+# Install the built .deb packages
+COPY target/debs/trixie/sonic-dbus-bridge_*.deb /tmp/
+COPY target/debs/trixie/bmcweb_*.deb /tmp/
+RUN [ $(ls -1 /tmp/sonic-dbus-bridge_*.deb | wc -l) -eq 1 ] || { echo "Multiple or zero sonic-dbus-bridge debs found"; exit 1; } && \
+    [ $(ls -1 /tmp/bmcweb_*.deb | wc -l) -eq 1 ] || { echo "Multiple or zero bmcweb debs found"; exit 1; } && \
+    dpkg --force-depends -i /tmp/sonic-dbus-bridge_*.deb /tmp/bmcweb_*.deb && \
+    apt-get -f install -y && \
+    rm -f /tmp/*.deb
+
+# Copy test files and config
+COPY pytest.ini /workspace/pytest.ini
+COPY tests/ /workspace/tests/
+COPY scripts/format_pytest_output.py /workspace/scripts/format_pytest_output.py
+COPY sonic-dbus-bridge/dbus/ /workspace/sonic-dbus-bridge/dbus/
+
+WORKDIR /workspace
+
+# Start services and run tests with formatted output
+# Using unbuffered output (-u) to show progress in real-time
+CMD ["bash", "-c", "bash tests/redfish-api/framework/start_services.sh && python3 -u -m pytest tests/redfish-api/ -v --tb=short 2>&1 | tee -a test_report.log | python3 -u scripts/format_pytest_output.py"]

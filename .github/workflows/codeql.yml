@@ -4,11 +4,11 @@
 #   - Python tooling / tests / scripts
 # For more information: https://github.com/github/codeql-action
 #
-# C/C++ uses CodeQL buildless analysis (build-mode: none) to start, so no
-# compilation/toolchain is required at this stage. The repo's normal build
-# runs inside Docker and cannot be traced by CodeQL autobuild; buildless
-# scanning gives static coverage without that dependency. A compiled (traced)
-# build mode can be added later if deeper analysis is wanted.
+# C/C++ uses a traced (compiled) build: the c-cpp job runs in a debian:trixie
+# container matching the repo's build toolchain (gcc 14, C++23, -Werror) and
+# compiles sonic-dbus-bridge with meson so CodeQL observes the real compiler
+# invocations. The repo's normal build runs inside Docker and cannot be traced
+# by CodeQL autobuild, so we drive the meson compile directly here.
 
 name: "CodeQL"
 
@@ -31,6 +31,9 @@ jobs:
     if: github.repository_owner == 'sonic-net'
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
+    # The C/C++ job builds sonic-dbus-bridge in a Debian trixie container so the
+    # toolchain (gcc 14 / C++23 / -Werror) matches the repo's real build env.
+    container: ${{ matrix.container }}
     permissions:
       actions: read
       contents: read
@@ -42,12 +45,38 @@ jobs:
         include:
           - language: python
             build-mode: none
+            container: ''
           - language: c-cpp
-            build-mode: none
+            build-mode: manual
+            container: 'debian:trixie'
 
     steps:
+      # debian:trixie is minimal and ships no git/node; actions/checkout needs
+      # git for a proper clone. Install it (and TLS certs) before checkout.
+      # This runs only for the containerized c-cpp job; the host-runner Python
+      # job already has git.
+      - name: Install checkout prerequisites (container)
+        if: matrix.language == 'c-cpp'
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # sonic-dbus-bridge build dependencies (only needed for the traced C/C++
+      # build). sdbusplus + stdexec are fetched as pinned meson subprojects
+      # during `meson setup`, so they need network but no system package.
+      - name: Install C/C++ build dependencies
+        if: matrix.language == 'c-cpp'
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkg-config cmake git ca-certificates \
+            python3 python3-pip python3-jinja2 python3-yaml python3-mako python3-inflection \
+            libsystemd-dev libboost-all-dev libhiredis-dev libjsoncpp-dev libcrypt-dev
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
@@ -56,6 +85,15 @@ jobs:
           config-file: ./.github/codeql/codeql-config.yml
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
+
+      # Traced build of the C++ component so CodeQL captures compiler calls.
+      - name: Build sonic-dbus-bridge (meson)
+        if: matrix.language == 'c-cpp'
+        run: |
+          set -euxo pipefail
+          cd sonic-dbus-bridge
+          meson setup obj-codeql
+          meson compile -C obj-codeql
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
